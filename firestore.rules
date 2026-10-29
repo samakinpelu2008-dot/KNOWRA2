@@ -1,0 +1,218 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+    function touched() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function delta(k) { return request.resource.data.get(k, 0) - resource.data.get(k, 0); }
+
+    // ---------- users (private account record) ----------
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.role == "contributor";
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == uid
+        && request.resource.data.role == resource.data.role);
+      allow delete: if isAdmin();
+
+      match /progress/{k} { allow read, write: if signedIn() && (request.auth.uid == uid || isAdmin()); }
+      match /saved/{k} { allow read, write: if signedIn() && (request.auth.uid == uid || isAdmin()); }
+      match /collections/{c} { allow read, write: if signedIn() && (request.auth.uid == uid || isAdmin()); }
+    }
+
+    // ---------- public author profiles ----------
+    function followDoc(authorId) { return /databases/$(database)/documents/follows/$(authorId + '_' + request.auth.uid); }
+    function followCountOk(authorId) {
+      return signedIn() && touched().hasOnly(['followersCount']) && (
+        (delta('followersCount') == 1 && !exists(followDoc(authorId)) && existsAfter(followDoc(authorId))) ||
+        (delta('followersCount') == -1 && exists(followDoc(authorId)) && !existsAfter(followDoc(authorId))));
+    }
+    match /profiles/{uid} {
+      allow read: if true;
+      allow create: if isAdmin() || (signedIn() && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.verification == "none"
+        && request.resource.data.followersCount == 0
+        && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username)).data.uid == uid);
+      allow update: if isAdmin()
+        || (signedIn() && request.auth.uid == uid
+            && !touched().hasAny(['verification', 'followersCount', 'uid', 'username', 'usernameLower', 'createdAt']))
+        || followCountOk(uid);
+      allow delete: if isAdmin();
+    }
+    match /usernames/{slug} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid']);
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+    match /follows/{fid} {
+      allow get, list: if signedIn() && (resource == null
+        || resource.data.followerId == request.auth.uid
+        || resource.data.authorId == request.auth.uid || isAdmin());
+      allow create: if signedIn() && request.resource.data.followerId == request.auth.uid
+        && fid == request.resource.data.authorId + '_' + request.auth.uid
+        && request.resource.data.keys().hasOnly(['authorId', 'followerId', 'createdAt']);
+      allow delete: if signedIn() && (resource.data.followerId == request.auth.uid || isAdmin());
+      allow update: if false;
+    }
+
+    // ---------- publications (counters can be bumped by readers, nothing else) ----------
+    function likeDoc(pk) { return /databases/$(database)/documents/likes/$(pk + '_' + request.auth.uid); }
+    function ratingDoc(pk) { return /databases/$(database)/documents/ratings/$(pk + '_' + request.auth.uid); }
+    function viewsOk() { return !touched().hasAny(['viewsCount']) || delta('viewsCount') == 1; }
+    function likesOk(pk) {
+      return !touched().hasAny(['likesCount']) || (signedIn() && (
+        (delta('likesCount') == 1 && !exists(likeDoc(pk)) && existsAfter(likeDoc(pk))) ||
+        (delta('likesCount') == -1 && exists(likeDoc(pk)) && !existsAfter(likeDoc(pk)))));
+    }
+    function ratingOk(pk) {
+      return !touched().hasAny(['ratingSum', 'ratingCount', 'ratingAvg']) || (signedIn()
+        && request.resource.data.get('ratingAvg', 0) >= 0 && request.resource.data.get('ratingAvg', 0) <= 5
+        && (
+          (delta('ratingCount') == 1 && !exists(ratingDoc(pk)) && existsAfter(ratingDoc(pk))
+            && delta('ratingSum') == getAfter(ratingDoc(pk)).data.value) ||
+          (delta('ratingCount') == 0 && exists(ratingDoc(pk)) && existsAfter(ratingDoc(pk))
+            && delta('ratingSum') == getAfter(ratingDoc(pk)).data.value - get(ratingDoc(pk)).data.value)));
+    }
+    function counterUpdate(pk) {
+      return resource.data.status == "published"
+        && touched().hasOnly(['viewsCount', 'likesCount', 'ratingSum', 'ratingCount', 'ratingAvg'])
+        && viewsOk() && likesOk(pk) && ratingOk(pk);
+    }
+
+    match /articles/{id} {
+      allow read: if resource == null || resource.data.status == "published" || isAdmin();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || counterUpdate('a_' + id);
+    }
+    match /books/{id} {
+      allow read: if resource == null || resource.data.status == "published" || isAdmin();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || counterUpdate('b_' + id);
+    }
+
+    // Book files live in Firestore as base64 chunks. Chunk id = {bookId}_{index}.
+    match /bookChunks/{chunkId} {
+      allow get: if isAdmin()
+        || (signedIn() && resource.data.submitterId == request.auth.uid)
+        || (exists(/databases/$(database)/documents/books/$(resource.data.bookId))
+            && get(/databases/$(database)/documents/books/$(resource.data.bookId)).data.status == "published");
+      allow list: if isAdmin();
+      allow create: if signedIn()
+        && request.resource.data.submitterId == request.auth.uid
+        && request.resource.data.keys().hasOnly(["bookId", "index", "data", "submitterId"])
+        && request.resource.data.data is string
+        && request.resource.data.data.size() <= 720000
+        && request.resource.data.index is int
+        && chunkId == request.resource.data.bookId + "_" + string(request.resource.data.index);
+      allow update, delete: if isAdmin();
+    }
+
+    // Contributions waiting for review.
+    match /submissions/{id} {
+      allow create: if signedIn()
+        && request.resource.data.submitterId == request.auth.uid
+        && request.resource.data.status == "pending"
+        && request.resource.data.contentType in ["article", "book"]
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 160
+        && (request.resource.data.contentType != "article"
+            || (request.resource.data.body is string
+                && request.resource.data.body.size() >= 80
+                && request.resource.data.body.size() <= 50000));
+      allow get: if signedIn() && (resource.data.submitterId == request.auth.uid || isAdmin());
+      allow list: if signedIn() && (resource.data.submitterId == request.auth.uid || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+
+    // ---------- interactions ----------
+    match /views/{vid} {
+      allow read: if isAdmin();
+      allow create: if request.resource.data.keys().hasOnly(['pubKey', 'rid', 'bucket', 't'])
+        && request.resource.data.rid is string && request.resource.data.rid.size() <= 40
+        && request.resource.data.pubKey is string
+        && request.resource.data.bucket is int
+        && request.resource.data.bucket * 21600000 <= request.time.toMillis()
+        && request.time.toMillis() < (request.resource.data.bucket + 1) * 21600000
+        && request.resource.data.t == request.time
+        && vid == request.resource.data.pubKey + '_' + request.resource.data.rid + '_' + string(request.resource.data.bucket);
+      allow update, delete: if false;
+    }
+    match /likes/{lid} {
+      allow get: if signedIn() && (resource == null || resource.data.uid == request.auth.uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && lid == request.resource.data.pubKey + '_' + request.auth.uid
+        && request.resource.data.keys().hasOnly(['pubKey', 'pubType', 'pubId', 'uid', 'createdAt']);
+      allow delete: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow update: if false;
+    }
+    match /ratings/{rid} {
+      allow get: if signedIn() && (resource == null || resource.data.uid == request.auth.uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && rid == request.resource.data.pubKey + '_' + request.auth.uid
+        && request.resource.data.value is int && request.resource.data.value >= 1 && request.resource.data.value <= 5
+        && request.resource.data.keys().hasOnly(['pubKey', 'pubType', 'pubId', 'uid', 'value', 'createdAt']);
+      allow update: if signedIn() && resource.data.uid == request.auth.uid
+        && request.resource.data.value is int && request.resource.data.value >= 1 && request.resource.data.value <= 5
+        && touched().hasOnly(['value', 'updatedAt']);
+      allow delete: if isAdmin();
+    }
+    match /comments/{cid} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && request.resource.data.text is string && request.resource.data.text.size() > 0 && request.resource.data.text.size() <= 1000
+        && request.resource.data.keys().hasOnly(['pubKey', 'pubType', 'pubId', 'uid', 'name', 'text', 'parentId', 'createdAt']);
+      allow delete: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow update: if false;
+    }
+    match /reports/{rid} {
+      allow create: if signedIn() && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == "open"
+        && request.resource.data.reason in ['Copyright', 'Plagiarism', 'Foul content', 'Unethical content', 'Misinformation', 'Harassment', 'Spam', 'Other']
+        && request.resource.data.description.size() <= 800;
+      allow get, list: if signedIn() && (resource.data.reporterId == request.auth.uid || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+    match /notifications/{nid} {
+      allow get, list: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isAdmin() || (signedIn()
+        && request.resource.data.fromUid == request.auth.uid
+        && request.resource.data.uid != request.auth.uid
+        && request.resource.data.type in ['reply', 'follow']
+        && request.resource.data.read == false
+        && request.resource.data.title.size() <= 120 && request.resource.data.body.size() <= 300
+        && request.resource.data.keys().hasOnly(['uid', 'fromUid', 'type', 'title', 'body', 'link', 'read', 'createdAt']));
+      allow update: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid && touched().hasOnly(['read']));
+      allow delete: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+    }
+    match /questions/{qid} {
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == "open" && request.resource.data.answer == ""
+        && request.resource.data.text is string && request.resource.data.text.size() >= 5 && request.resource.data.text.size() <= 500
+        && request.resource.data.keys().hasOnly(['uid', 'userName', 'text', 'status', 'answer', 'createdAt']);
+      allow get, list: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+
+    // ---------- site content managed by Admin ----------
+    match /faq/{id} { allow read: if resource.data.published == true || isAdmin(); allow write: if isAdmin(); }
+    match /categories/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /recommendations/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /faqCandidates/{id} { allow read, write: if isAdmin(); }
+    match /qualityFlags/{id} { allow read, write: if isAdmin(); }
+    match /siteKnowledge/{id} { allow read, write: if isAdmin(); }
+    match /adminSettings/{id} { allow read, write: if isAdmin(); }
+  }
+}

@@ -1,0 +1,5 @@
+{ "rewrites": [
+  { "source": "/article/:slug", "destination": "/api/share?kind=article&slug=:slug" },
+  { "source": "/book/:slug", "destination": "/api/share?kind=book&slug=:slug" },
+  { "source": "/author/:slug", "destination": "/api/share?kind=author&slug=:slug" }
+] }
